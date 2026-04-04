@@ -1,0 +1,5 @@
+BASE_DIR: C:\Users\surfi\OneDrive\Desktop\Code\BongoBass
+PNG_IDLE: <PyQt6.QtGui.QPixmap object at 0x00000152F2E58900>
+PNG_LEFT: <PyQt6.QtGui.QPixmap object at 0x00000152F2E58970>
+PNG_RIGHT: <PyQt6.QtGui.QPixmap object at 0x00000152F2E589E0>
+PNG_DOWN: <PyQt6.QtGui.QPixmap object at 0x00000152F2E58A50>
