@@ -1,33 +1,21 @@
 import sys
 import traceback
-sys.stderr = open("C:/Users/surfi/OneDrive/Desktop/Code/BongoBass/crash.log", "w")
 import threading
+import time
 import os
-import socket
 from pynput import keyboard, mouse
+import pygame
 from PyQt6.QtWidgets import QApplication, QMainWindow, QMenu, QLabel
 from PyQt6.QtCore import (Qt, QTimer, QPoint, QEasingCurve,
                            QPropertyAnimation, QSequentialAnimationGroup,
                            pyqtSignal, QObject, QPauseAnimation)
 from PyQt6.QtGui import QPixmap, QTransform
 
-import traceback
-
 def excepthook(type, value, tb):
     with open("C:/Users/surfi/OneDrive/Desktop/Code/BongoBass/crash.log", "w") as f:
         traceback.print_exception(type, value, tb, file=f)
 
 sys.excepthook = excepthook
-
-# --- SINGLE INSTANCE LOCK ---
-# This prevents more than one drummer from running at the same time.
-# try:
-#     lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-#     # Using a specific port as a "lock"
-#     lock_socket.bind(("127.0.0.1", 47200))
-# except socket.error:
-#     # If the port is already in use, another drummer is running.
-#     sys.exit()
 
 # --- CONFIG ---
 TASKBAR_H = 48        
@@ -38,7 +26,14 @@ MAX_BOUNCE = 50
 MIN_BOUNCE_DROP = 40  
 SAVE_INTERVAL = 30000 
 MILESTONE_STEP = 500    
-
+WPM_DECAY_MS = 100
+WPM_ALPHA = 0.1
+THEMES = {
+    "SCV": "SCV",
+    "BD": "BD",
+    "DRUMSET": "DRUMSET"
+}
+DEFAULT_THEME = "SCV"
 
 # ---------------------------------------------------------------------------
 # Load PNG frames from files
@@ -122,9 +117,20 @@ class DrummerWindow(QMainWindow):
         # Context Menu for quitting
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._show_context_menu)
-        
-        self._show_counter = True        
+
+        self._show_counter = True
+        self._is_flipped = False 
+        self.current_theme = "SCV"       
         self._load_hits()
+
+        # --- WPM Tracking ---
+        self.keystroke_times = [] 
+        self.current_wpm = 0
+        self.wpm_timer = QTimer()
+        self.wpm_timer.timeout.connect(self._calculate_wpm)
+        self.wpm_timer.start(WPM_DECAY_MS)
+
+        # --- CELEBRATION & ANIMATION STATE ---
         self._is_dirty = False 
         self._is_celebrating = False
         self._last_milestone = (self.hit_count // MILESTONE_STEP) * MILESTONE_STEP
@@ -141,14 +147,19 @@ class DrummerWindow(QMainWindow):
         self.img_label.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
         self.counter_label = QLabel(self)
-        self.counter_label.setGeometry(0, 185, 200, 20)
-        self.counter_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        if self._is_flipped:
+            self.counter_label.setGeometry(50, 185, 80, 50)
+        else:
+            self.counter_label.setGeometry(110, 185, 80, 50)
+        self.counter_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter )
         self.counter_label.setStyleSheet("""
             color: white;
-            font-family: Arial;
-            font-size: 10px;
-            font-weight: bold;
-            background: red;
+            font-family: Arial Black, Arial;
+            font-size: 9px;
+            font-weight: 900;
+            line-height: 0.8;
+            background: transparent;
+            letter-spacing: 1px;
         """)
         self.counter_label.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.counter_label.setAutoFillBackground(False)
@@ -164,19 +175,9 @@ class DrummerWindow(QMainWindow):
         global_signals.mouse_scroll.connect(self._on_scroll)
 
         self._drag_pos = None; self._anim_group = None; self._velocity = QPoint(0, 0)
-        self._is_flipped = False
         self._is_tacet = False
         self._errors = []
-        self.PNG_IDLE  = _load_png("set.png")
-        self.PNG_LEFT  = _load_png("left.png")
-        self.PNG_RIGHT = _load_png("right.png")
-        self.PNG_DOWN  = _load_png("down.png")
-        with open("C:/Users/surfi/OneDrive/Desktop/Code/BongoBass/crash.log", "a") as f:
-            f.write(f"BASE_DIR: {BASE_DIR}\n")
-            f.write(f"PNG_IDLE: {self.PNG_IDLE}\n")
-            f.write(f"PNG_LEFT: {self.PNG_LEFT}\n")
-            f.write(f"PNG_RIGHT: {self.PNG_RIGHT}\n")
-            f.write(f"PNG_DOWN: {self.PNG_DOWN}\n")
+        self._update_assets()
         self._idle()
 
     # Menu with options to turn, toggle tacet mode, and quit
@@ -213,6 +214,20 @@ class DrummerWindow(QMainWindow):
         counter_action.setChecked(self._show_counter)        
         menu.addSeparator()
         
+        theme_menu = menu.addMenu("Theme")
+        theme_menu.setStyleSheet(menu.styleSheet())
+        
+        scv_act = theme_menu.addAction("SCV")
+        bd_act = theme_menu.addAction("BD")
+        ds_act = theme_menu.addAction("DRUMSET")
+        
+        # Make them checkable to show which is active
+        scv_act.setCheckable(True); scv_act.setChecked(self.current_theme == "SCV")
+        bd_act.setCheckable(True); bd_act.setChecked(self.current_theme == "BD")
+        ds_act.setCheckable(True); ds_act.setChecked(self.current_theme == "DRUMSET")
+        
+        menu.addSeparator()
+
         reset_action = menu.addAction("Reset Counter")
         menu.addSeparator()
         quit_action = menu.addAction("Quit Drummer")
@@ -222,9 +237,18 @@ class DrummerWindow(QMainWindow):
         if action == clear_action if self._errors else None:
             self._errors.clear()
             return
+        
+        # --- THEME SELECTION ---
+        if action == scv_act:
+            self._set_theme("SCV")
+        elif action == bd_act:
+            self._set_theme("BD")
+        elif action == ds_act:
+            self._set_theme("DRUMSET")
 
         if action == turn_action:
             self._is_flipped = not self._is_flipped
+            self._update_counter()  # Move counter to other side
             self._idle()
         elif action == tacet_action:
             self._is_tacet = not self._is_tacet
@@ -242,6 +266,39 @@ class DrummerWindow(QMainWindow):
             self._save_hits()
             QApplication.quit()
 
+    def _calculate_wpm(self):
+        now = time.time()
+        # Look back 2 seconds
+        self.keystroke_times = [t for t in self.keystroke_times if now - t < 2]
+        
+        if not self.keystroke_times:
+            instant_wpm = 0
+        else:
+            keys = len(self.keystroke_times)
+            # (Keys / 5) / (2 / 60 minutes)
+            instant_wpm = (keys / 5) / (2 / 60)
+
+        self.current_wpm = (instant_wpm * WPM_ALPHA) + (self.current_wpm * (1 - WPM_ALPHA))
+        
+        if self.current_wpm < 0.5: self.current_wpm = 0
+        self._update_counter()
+
+    def _update_counter(self):
+        if not hasattr(self, 'counter_label') or not self._show_counter:
+            return
+        
+        # ... (Your existing count formatting: 1.2k, etc.) ...
+        count = self.hit_count
+        if count >= 1000: display = f"{count/1000:.2f}k"
+        else: display = str(count)
+
+        # Add the WPM to the label
+        full_text = f"{display}\n{int(self.current_wpm)} WPM"
+        self.counter_label.setText(full_text)
+        
+        # Adjust label height to fit two lines
+        self.counter_label.setFixedHeight(40)
+
     def _load_hits(self):
         try:
             if os.path.exists(SAVE_FILE):
@@ -256,6 +313,24 @@ class DrummerWindow(QMainWindow):
                 self._is_dirty = False
             except: pass
 
+    def _update_assets(self):
+            """Reloads PNGs based on the current theme prefix."""
+            if self.current_theme == "DRUMSET":
+                # Clear PNGs so the logic falls back to SVG
+                self.PNG_IDLE = self.PNG_LEFT = self.PNG_RIGHT = self.PNG_DOWN = None
+            else:
+                prefix = self.current_theme
+                self.PNG_IDLE  = _load_png(f"{prefix}set.png")
+                self.PNG_LEFT  = _load_png(f"{prefix}left.png")
+                self.PNG_RIGHT = _load_png(f"{prefix}right.png")
+                self.PNG_DOWN  = _load_png(f"{prefix}down.png")
+            
+            self._idle() # Refresh the visual immediately
+
+    def _set_theme(self, theme_name):
+        self.current_theme = theme_name
+        self._update_assets()
+
     def _set_frame(self, frame_type):
         if self._is_tacet and frame_type not in ("CEL_UP", "CEL_DOWN"):
             px = self.PNG_DOWN or self.PNG_IDLE
@@ -268,17 +343,37 @@ class DrummerWindow(QMainWindow):
         else:
             px = self.PNG_IDLE
 
-        if px is None:
-            return
+        if px is not None:
+            if self._is_flipped:
+                px = px.transformed(QTransform().scale(-1, 1))
+            self.img_label.setPixmap(px)
+        else:
+            self._set_svg_frame(frame_type)
+            
+    def _set_svg_frame(self, frame_type):
+        from PyQt6.QtSvg import QSvgRenderer
+        from PyQt6.QtCore import QByteArray
+        from PyQt6.QtGui import QPainter
+
+        svg_data = get_svg_frame(frame_type, self.hit_count)
+        renderer = QSvgRenderer(QByteArray(svg_data.encode('utf-8')))
+
+        px = QPixmap(200, 200)
+        px.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(px)
+        renderer.render(painter)
+        painter.end()
 
         if self._is_flipped:
             px = px.transformed(QTransform().scale(-1, 1))
 
         self.img_label.setPixmap(px)
-
+        
     def _on_key(self):
         self.hit_count += 1
+        self.keystroke_times.append(time.time())
         self._update_counter()
+
         self._is_dirty = True
         if self.hit_count >= self._last_milestone + MILESTONE_STEP:
             self._last_milestone = (self.hit_count // MILESTONE_STEP) * MILESTONE_STEP
@@ -287,7 +382,7 @@ class DrummerWindow(QMainWindow):
         if not self._is_celebrating:
             self._set_frame("RIGHT" if self.hit_right_next else "LEFT")
             self.hit_right_next = not self.hit_right_next
-            self.reset_timer.start(120)
+            self.reset_timer.start(150)
 
     def _trigger_celebration(self):
         if self._is_celebrating: return
@@ -312,10 +407,6 @@ class DrummerWindow(QMainWindow):
             up.setDuration(100)
             up.setEasingCurve(QEasingCurve.Type.OutQuad)
 
-            flip_to = spin_states[i + 1]
-            def make_up_cb(ft=frame_up, f=flipped):
-                self._is_flipped = f
-                self._set_frame(ft)
             up.finished.connect(lambda ft=frame_up, f=flipped: (
                 setattr(self, '_is_flipped', f) or self._set_frame(ft)
             ))
@@ -356,20 +447,31 @@ class DrummerWindow(QMainWindow):
             self.reset_timer.start(40)
 
     def _update_counter(self):
-        if not hasattr(self, 'counter_label'):
-            return
-        if not self._show_counter:
+        if not hasattr(self, 'counter_label') or not self._show_counter:
             self.counter_label.hide()
             return
+            
         self.counter_label.show()
+        
+        # 1. Format the Total Hits (Existing logic)
         count = self.hit_count
-        if count >= 1000000:
-            display = f"{count/1000000:.2f}M"
-        elif count >= 1000:
-            display = f"{count/1000:.1f}k"
+        if count >= 1000000: display_hits = f"{count/1000000:.2f}M"
+        elif count >= 1000: display_hits = f"{count/1000:.1f}k"
+        else: display_hits = str(count)
+        
+        # 2. Format the WPM (New logic)
+        # We'll use int() to keep it from flickering with decimals
+        display_wpm = f"{int(self.current_wpm)} WPM"
+        
+        # 3. Push to UI
+        # This creates two lines: The total count on top, WPM on bottom
+        self.counter_label.setText(f"{display_hits}\n{display_wpm}")
+        
+        # Ensure the position is correct based on flip
+        if self._is_flipped:
+            self.counter_label.move(50, 165)
         else:
-            display = str(count)
-        self.counter_label.setText(display)
+            self.counter_label.move(110, 165)
 
     def _idle(self):
         if not self._is_celebrating:
@@ -431,6 +533,55 @@ class DrummerWindow(QMainWindow):
     def mouseReleaseEvent(self, event):
         if self._drag_pos: self._drop_and_settle(); self._drag_pos = None
 
+def start_controller_listener():
+    pygame.init()
+    pygame.joystick.init()
+    
+    if pygame.joystick.get_count() == 0:
+        return
+
+    # Find first actual joystick/gamepad, skip mice and other HID devices
+    joystick = None
+    for i in range(pygame.joystick.get_count()):
+        j = pygame.joystick.Joystick(i)
+        j.init()
+        name = j.get_name().lower()
+        # Skip if it looks like a mouse or non-gamepad HID device
+        if any(x in name for x in ("mouse", "trackpad", "touchpad", "keyboard")):
+            j.quit()
+            continue
+        joystick = j
+        break
+
+    if joystick is None:
+        return
+
+    held_buttons = set()
+
+    while True:
+        # Use event queue instead of polling — much more precise
+        for event in pygame.event.get():
+            # Button press only — not release
+            if event.type == pygame.JOYBUTTONDOWN:
+                if event.button not in held_buttons:
+                    held_buttons.add(event.button)
+                    global_signals.keystroke.emit()
+
+            elif event.type == pygame.JOYBUTTONUP:
+                held_buttons.discard(event.button)
+
+            # Analog triggers only (not thumbsticks)
+            elif event.type == pygame.JOYAXISMOTION:
+                # Only care about trigger axes (2 = L2, 5 = R2 on PS4)
+                if event.axis in (2, 5):
+                    if event.value > 0.5 and event.axis not in held_buttons:
+                        held_buttons.add(event.axis)
+                        global_signals.keystroke.emit()
+                    elif event.value <= 0.5 and event.axis in held_buttons:
+                        held_buttons.discard(event.axis)
+
+        pygame.time.wait(16)
+
 held_keys = set()
 def start_listeners():
     def on_press(key):
@@ -455,6 +606,7 @@ if __name__ == "__main__":
 
         sys.excepthook = handle_exception
         threading.Thread(target=start_listeners, daemon=True).start()
+        threading.Thread(target=start_controller_listener, daemon=True).start()
         sys.exit(app.exec())
 
     except Exception:
